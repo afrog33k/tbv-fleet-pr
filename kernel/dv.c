@@ -18,6 +18,7 @@
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/version.h>
 #include <rdma/ib_umem.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/uverbs_ioctl.h>
@@ -198,6 +199,16 @@ static void tbv_dv_pin_release(struct tbv_dv_pin_result *res)
 	memset(res, 0, sizeof(*res));
 }
 
+static struct ib_umem *tbv_dv_umem_get(struct ib_device *dev, u64 addr,
+				       size_t size, int access)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	return ib_umem_get_va(dev, addr, size, access);
+#else
+	return ib_umem_get(dev, addr, size, access);
+#endif
+}
+
 static int tbv_dv_validate_cpu_visible_umem(struct ib_umem *umem)
 {
 	struct sg_table *sgt = &umem->sgt_append.sgt;
@@ -232,7 +243,7 @@ static int tbv_dv_pin_queue(struct ib_device *dev,
 
 	memset(res, 0, sizeof(*res));
 
-	res->sq_umem = ib_umem_get(dev, req->sq_addr, sq_bytes, access);
+	res->sq_umem = tbv_dv_umem_get(dev, req->sq_addr, sq_bytes, access);
 	if (IS_ERR(res->sq_umem)) {
 		int ret = PTR_ERR(res->sq_umem);
 
@@ -245,7 +256,7 @@ static int tbv_dv_pin_queue(struct ib_device *dev,
 		return ret;
 	}
 
-	res->cq_umem = ib_umem_get(dev, req->cq_addr, cq_bytes, access);
+	res->cq_umem = tbv_dv_umem_get(dev, req->cq_addr, cq_bytes, access);
 	if (IS_ERR(res->cq_umem)) {
 		int ret = PTR_ERR(res->cq_umem);
 
@@ -259,9 +270,9 @@ static int tbv_dv_pin_queue(struct ib_device *dev,
 		return ret;
 	}
 
-	res->doorbell_umem = ib_umem_get(dev, req->doorbell_addr,
-					 USB4_RDMA_DV_DOORBELL_PAGE_SIZE,
-					 access);
+	res->doorbell_umem = tbv_dv_umem_get(dev, req->doorbell_addr,
+					     USB4_RDMA_DV_DOORBELL_PAGE_SIZE,
+					     access);
 	if (IS_ERR(res->doorbell_umem)) {
 		int ret = PTR_ERR(res->doorbell_umem);
 
