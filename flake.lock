@@ -18,6 +18,24 @@
         "url": "https://git.kernel.org/pub/scm/linux/kernel/git/westeri/thunderbolt.git"
       }
     },
+    "linux-stable": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1786312490,
+        "narHash": "sha256-/DWgi9VEk6DhN0+Mz3fqr9f+2K9V91J/4mWXP0CaIOM=",
+        "ref": "refs/tags/v7.2-rc7",
+        "rev": "db2ddb87143519e20a95aa36c60b36107b736a58",
+        "shallow": true,
+        "type": "git",
+        "url": "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+      },
+      "original": {
+        "ref": "refs/tags/v7.2-rc7",
+        "shallow": true,
+        "type": "git",
+        "url": "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1780749050,
@@ -37,6 +55,7 @@
     "root": {
       "inputs": {
         "linux-src": "linux-src",
+        "linux-stable": "linux-stable",
         "nixpkgs": "nixpkgs"
       }
     }

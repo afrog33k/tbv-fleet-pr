@@ -238,7 +238,7 @@ index 0f795ea58756..4fac166ed2ce 100644
  	return frame;
 @@ -448,6 +593,7 @@ irqreturn_t ring_msix(int irq, void *data)
  	spin_lock(&ring->nhi->lock);
- 	ring_clear_msix(ring);
+ 	ring_clear_msix_pending(ring);
  	spin_lock(&ring->lock);
 +	ring->debug_msix_interrupts++;
  	__ring_interrupt(ring);
