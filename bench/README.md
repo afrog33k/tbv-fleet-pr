@@ -140,4 +140,31 @@ shape. UC SEND is the reliable Apple smoke path; UC WRITE cases are still useful
 for investigation but can hang or report misleading bandwidth depending on the
 peer implementation.
 
+Apple's provider currently reports a local length error when the Apple side
+posts a large receive SGE and the peer sends a shorter UC SEND. Reproduce that
+case with `uc_oneway` directly or through the stress runner:
+
+```sh
+python3 userspace/bench/tbv_uc_stress.py \
+  --server goblin.lan.satanic.link \
+  --client strix-2.lan.satanic.link \
+  --server-dev rdma_en3 \
+  --client-dev usb4_rdma4 \
+  --server-connect-host 192.168.23.247 \
+  --receiver-sizes 65536 \
+  --sender-sizes 8 \
+  --count 4 \
+  --send-depths 8 \
+  --recv-depth 8 \
+  --recv-posts 8 \
+  --mtus 1024 \
+  --no-check \
+  --stop-on-fail \
+  --tag apple-short-send-repro \
+  --csv /tmp/apple-short-send-repro.csv
+```
+
+The expected failure on macOS is `recv wc error ... status=1 ... byte_len=8`.
+Same-size UC SENDs on the same path are expected to complete.
+
 Historical checked-in result sets live under `bench/results/`.

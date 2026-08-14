@@ -250,6 +250,7 @@ struct tbv_rail {
 	 */
 	struct tbv_ibdev *ibdev;
 	atomic_t native_qp_bind_count;
+	struct tbv_qp *apple_active_qp;
 	u32 apple_tunnel_qps;
 	u32 rail_id;
 	u32 link_speed;

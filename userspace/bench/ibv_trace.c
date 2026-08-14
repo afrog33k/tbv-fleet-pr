@@ -26,8 +26,12 @@ static int (*real_ibv_cmd_poll_cq)(struct ibv_cq *cq, int num_entries,
 static struct ibv_mr *(*real_ibv_reg_mr)(struct ibv_pd *pd, void *addr,
 					 size_t length, int access);
 static struct ibv_mr *(*real_ibv_reg_mr_iova2)(struct ibv_pd *pd, void *addr,
-					       size_t length, uint64_t iova,
-					       unsigned int access);
+						       size_t length, uint64_t iova,
+						       unsigned int access);
+static struct ibv_mr *(*real_ibv_reg_dmabuf_mr)(struct ibv_pd *pd,
+						uint64_t offset, size_t length,
+						uint64_t iova, int fd,
+						int access);
 static int (*real_ibv_dereg_mr)(struct ibv_mr *mr);
 
 static pthread_once_t resolve_once = PTHREAD_ONCE_INIT;
@@ -51,12 +55,15 @@ static void resolve_syms(void)
 	real_ibv_reg_mr = dlsym(verbs ? verbs : RTLD_NEXT, "ibv_reg_mr");
 	real_ibv_reg_mr_iova2 = dlsym(verbs ? verbs : RTLD_NEXT,
 				      "ibv_reg_mr_iova2");
+	real_ibv_reg_dmabuf_mr = dlsym(verbs ? verbs : RTLD_NEXT,
+				       "ibv_reg_dmabuf_mr");
 	real_ibv_dereg_mr = dlsym(verbs ? verbs : RTLD_NEXT, "ibv_dereg_mr");
 	fprintf(stderr,
-		"IBV_TRACE resolved post_send=%p post_recv=%p poll_cq=%p reg_mr=%p reg_mr_iova2=%p dereg_mr=%p\n",
+		"IBV_TRACE resolved post_send=%p post_recv=%p poll_cq=%p reg_mr=%p reg_mr_iova2=%p reg_dmabuf_mr=%p dereg_mr=%p\n",
 		real_ibv_cmd_post_send, real_ibv_cmd_post_recv,
 		real_ibv_cmd_poll_cq, real_ibv_reg_mr,
-		real_ibv_reg_mr_iova2, real_ibv_dereg_mr);
+		real_ibv_reg_mr_iova2, real_ibv_reg_dmabuf_mr,
+		real_ibv_dereg_mr);
 	fflush(stderr);
 }
 
@@ -138,9 +145,9 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 	}
 	mr = real_ibv_reg_mr(pd, addr, length, access);
 	fprintf(stderr,
-		"IBV_TRACE reg_mr addr=%p length=%zu access=0x%x -> mr=%p lkey=0x%x rkey=0x%x\n",
-		addr, length, access, mr, mr ? mr->lkey : 0,
-		mr ? mr->rkey : 0);
+		"IBV_TRACE reg_mr addr=%p length=%zu access=0x%x -> mr=%p errno=%d lkey=0x%x rkey=0x%x\n",
+		addr, length, access, mr, mr ? 0 : errno,
+		mr ? mr->lkey : 0, mr ? mr->rkey : 0);
 	return mr;
 }
 
@@ -156,9 +163,29 @@ struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
 	}
 	mr = real_ibv_reg_mr_iova2(pd, addr, length, iova, access);
 	fprintf(stderr,
-		"IBV_TRACE reg_mr_iova2 addr=%p length=%zu iova=0x%lx access=0x%x -> mr=%p lkey=0x%x rkey=0x%x\n",
+		"IBV_TRACE reg_mr_iova2 addr=%p length=%zu iova=0x%lx access=0x%x -> mr=%p errno=%d lkey=0x%x rkey=0x%x\n",
 		addr, length, (unsigned long)iova, access, mr,
-		mr ? mr->lkey : 0, mr ? mr->rkey : 0);
+		mr ? 0 : errno, mr ? mr->lkey : 0, mr ? mr->rkey : 0);
+	return mr;
+}
+
+struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
+				 size_t length, uint64_t iova, int fd,
+				 int access)
+{
+	struct ibv_mr *mr;
+
+	pthread_once(&resolve_once, resolve_syms);
+	if (!real_ibv_reg_dmabuf_mr) {
+		errno = ENOSYS;
+		return NULL;
+	}
+	mr = real_ibv_reg_dmabuf_mr(pd, offset, length, iova, fd, access);
+	fprintf(stderr,
+		"IBV_TRACE reg_dmabuf_mr offset=0x%lx length=%zu iova=0x%lx fd=%d access=0x%x -> mr=%p errno=%d lkey=0x%x rkey=0x%x\n",
+		(unsigned long)offset, length, (unsigned long)iova, fd,
+		access, mr, mr ? 0 : errno, mr ? mr->lkey : 0,
+		mr ? mr->rkey : 0);
 	return mr;
 }
 

@@ -54,6 +54,7 @@ struct opts {
 	int fifo;
 	int count;
 	int iova2;
+	int linger_ms;
 	size_t stride;
 };
 
@@ -73,6 +74,18 @@ static uint64_t now_ns(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void sleep_ms(int ms)
+{
+	struct timespec ts;
+
+	if (ms <= 0)
+		return;
+	ts.tv_sec = ms / 1000;
+	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+	while (nanosleep(&ts, &ts) && errno == EINTR)
+		;
 }
 
 static int send_all(int fd, const void *buf, size_t len)
@@ -167,7 +180,7 @@ static void usage(const char *argv0)
 		"          [--timeout-ms N] [--unsignaled] [--imm] [--no-recv]\n"
 		"          [--expect-no-write] [--recv-sge]\n"
 		"          [--fifo] [--count N] [--stride BYTES] [--signal-first]\n"
-		"          [--iova2]\n",
+		"          [--iova2] [--linger-ms N]\n",
 		argv0);
 }
 
@@ -198,6 +211,8 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 			o->ib_port = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc)
 			o->timeout_ms = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--linger-ms") && i + 1 < argc)
+			o->linger_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--unsignaled"))
 			o->signaled = 0;
 		else if (!strcmp(argv[i], "--signal-first"))
@@ -228,6 +243,8 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	if (!strcmp(o->role, "writer") && !o->connect_host)
 		return -1;
 	if (o->timeout_ms <= 0)
+		return -1;
+	if (o->linger_ms < 0)
 		return -1;
 	if (o->count <= 0 || o->count > 32 || !o->stride)
 		return -1;
@@ -621,6 +638,7 @@ int main(int argc, char **argv)
 		       wc.opcode, wc.byte_len, fifo->idx, fifo->size,
 		       fifo->nreqs, fifo->tag, fifo->rkeys[0], o.no_recv,
 		       o.expect_no_write, o.count, o.stride);
+		sleep_ms(o.linger_ms);
 	}
 
 out:

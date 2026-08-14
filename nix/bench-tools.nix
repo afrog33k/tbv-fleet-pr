@@ -3,6 +3,8 @@
 , pkg-config
 , apple-sdk_26 ? null
 , rdma-core-usb4 ? null
+, rocm-sdk ? null
+, rocmOffloadArch ? null
 , python3
 , source ? ../userspace/bench
 , appleCompat ? ./apple-compat
@@ -25,8 +27,12 @@ let
 
   # Full Linux set. ibv_trace is an LD_PRELOAD tracer built as .so.
   linuxPrograms = darwinPrograms ++ [
+    "dmabuf_mr_probe"
     "rc_qpn_churn"
     "rdma_gid_probe"
+  ];
+  hipPrograms = lib.optionals (!isDarwin && rocm-sdk != null) [
+    "hip_rdma_write_visibility_probe"
   ];
 
   scripts = [
@@ -37,6 +43,15 @@ let
   ];
 
   cPrograms = if isDarwin then darwinPrograms else linuxPrograms;
+  installPrograms = cPrograms ++ hipPrograms;
+  cxxInclude = "${stdenv.cc.cc}/include/c++/${stdenv.cc.cc.version}";
+  cxxTargetInclude = "${cxxInclude}/${stdenv.hostPlatform.config}";
+  libcDev = lib.getDev stdenv.cc.libc;
+  libcLib = lib.getLib stdenv.cc.libc;
+  gccLib = lib.getLib stdenv.cc.cc;
+  rocmArchFlag =
+    lib.optionalString (rocmOffloadArch != null)
+      "--offload-arch=${rocmOffloadArch}";
 in
 assert lib.assertMsg (!isDarwin || apple-sdk_26 != null)
   "bench-tools Darwin build requires apple-sdk_26";
@@ -54,12 +69,14 @@ stdenv.mkDerivation {
         rel = baseNameOf (toString path);
       in
         lib.hasSuffix ".c" rel
+        || lib.hasSuffix ".cpp" rel
         || lib.hasSuffix ".py" rel
         || lib.hasSuffix ".sh" rel;
   };
 
   nativeBuildInputs = lib.optionals (!isDarwin) [ pkg-config ];
   buildInputs = lib.optionals (!isDarwin) [ rdma-core-usb4 ]
+    ++ lib.optionals (hipPrograms != [ ]) [ rocm-sdk ]
     ++ lib.optionals isDarwin [ apple-sdk_26 ]
     ++ [ python3 ];
 
@@ -98,13 +115,36 @@ stdenv.mkDerivation {
         -L${rdma-core-usb4}/lib -libverbs \
         -Wl,-rpath,${rdma-core-usb4}/lib \
         -o libibv_trace.so
+      ${lib.optionalString (hipPrograms != [ ]) ''
+        for name in ${lib.concatStringsSep " " hipPrograms}; do
+          ROCM_PATH=${rocm-sdk} ${rocm-sdk}/bin/hipcc \
+            -O2 -Wall -Wextra -std=c++17 ${rocmArchFlag} \
+            --gcc-toolchain=${stdenv.cc.cc} \
+            -isystem ${cxxInclude} \
+            -isystem ${cxxTargetInclude} \
+            -isystem ${libcDev}/include \
+            -I${rdma-core-usb4.dev}/include \
+            "$name.cpp" \
+            -L${rdma-core-usb4}/lib -libverbs \
+            -L${rocm-sdk}/lib -lhsa-runtime64 \
+            -B${libcLib}/lib \
+            -L${libcLib}/lib \
+            -L${gccLib}/lib \
+            -Wl,-rpath,${rdma-core-usb4}/lib \
+            -Wl,-rpath,${libcLib}/lib \
+            -Wl,-rpath,${gccLib}/lib \
+            -Wl,-rpath,${rocm-sdk}/lib \
+            -Wl,-dynamic-linker,${libcLib}/lib/ld-linux-x86-64.so.2 \
+            -o "$name"
+        done
+      ''}
       runHook postBuild
     '';
 
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin
-    install -m 0755 ${lib.concatStringsSep " " cPrograms} $out/bin/
+    install -m 0755 ${lib.concatStringsSep " " installPrograms} $out/bin/
     install -m 0755 ${lib.concatStringsSep " " scripts} $out/bin/
     ${lib.optionalString (!isDarwin) ''
       mkdir -p $out/lib

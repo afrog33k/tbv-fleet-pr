@@ -7,6 +7,7 @@
 #include <linux/crc32.h>
 #include <linux/crc32c.h>
 #include <linux/delay.h>
+#include <linux/dma-buf.h>
 #include <linux/errno.h>
 #include <linux/highmem.h>
 #include <linux/idr.h>
@@ -36,6 +37,8 @@
 #include "../proto/reliability.h"
 #include "tbv.h"
 
+MODULE_IMPORT_NS("DMA_BUF");
+
 #define TBV_IBDEV_ABI_VERSION 1
 #define TBV_IBDEV_PORTS 1
 #define TBV_IBDEV_MAX_QP 256
@@ -47,6 +50,7 @@
 #define TBV_IBDEV_QPN_MIN 0x900
 #define TBV_IBDEV_QPN_MAX 0x00ffffff
 #define TBV_APPLE_PRIMARY_QPN TBV_IBDEV_QPN_MIN
+#define TBV_APPLE_QPN_ALIAS_COUNT 256
 #define TBV_IBDEV_PAGE_SIZE_CAP (SZ_4K | SZ_2M | SZ_1G)
 #define TBV_PSN_MASK 0x00ffffffu
 /*
@@ -610,6 +614,7 @@ struct tbv_gsi_send_ctx {
 };
 
 static DEFINE_IDA(tbv_qpn_ida);
+static atomic_t tbv_apple_qpn_next = ATOMIC_INIT(0);
 static atomic_t tbv_mr_key = ATOMIC_INIT(1);
 
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
@@ -769,12 +774,34 @@ static u32 tbv_apple_qpn_from_path(const struct tbv_path *path)
 	return (u32)path->cfg.receive_path << TBV_APPLE_QPN_SHIFT;
 }
 
+static int tbv_alloc_apple_qpn(const struct tbv_rail *rail)
+{
+	u32 base = tbv_apple_qpn_from_path(rail ? &rail->path : NULL);
+	u32 start = (u32)atomic_inc_return(&tbv_apple_qpn_next) - 1;
+	int ret = -ENOSPC;
+	u32 i;
+
+	if (base > TBV_IBDEV_QPN_MAX - (TBV_APPLE_QPN_ALIAS_COUNT - 1))
+		return -EINVAL;
+
+	for (i = 0; i < TBV_APPLE_QPN_ALIAS_COUNT; i++) {
+		u32 alias = (start + i) & (TBV_APPLE_QPN_ALIAS_COUNT - 1);
+		u32 qpn = base + alias;
+
+		ret = ida_alloc_range(&tbv_qpn_ida, qpn, qpn, GFP_KERNEL);
+		if (ret >= 0)
+			return ret;
+	}
+
+	return ret;
+}
+
 static int tbv_alloc_qpn(const struct tbv_state *state,
-			 enum tbv_backend_type backend)
+			 enum tbv_backend_type backend,
+			 const struct tbv_rail *rail)
 {
 	if (tbv_backend_is_apple(backend))
-		return ida_alloc_range(&tbv_qpn_ida, TBV_APPLE_PRIMARY_QPN,
-				       TBV_APPLE_PRIMARY_QPN, GFP_KERNEL);
+		return tbv_alloc_apple_qpn(rail);
 
 	return ida_alloc_range(&tbv_qpn_ida,
 			       state && state->cfg.apple_enabled ?
@@ -892,6 +919,22 @@ static bool tbv_qp_get_live(struct tbv_qp *tqp)
 		ok = true;
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	return ok;
+}
+
+static struct tbv_qp *tbv_qp_get_apple_by_path(struct tbv_state *state,
+					       const struct tbv_path *path)
+{
+	struct tbv_qp *tqp = NULL;
+
+	if (!state || !path || !path->rail)
+		return NULL;
+
+	mutex_lock(&state->lock);
+	tqp = path->rail->apple_active_qp;
+	if (tqp && !tbv_qp_get_live(tqp))
+		tqp = NULL;
+	mutex_unlock(&state->lock);
+	return tqp;
 }
 
 static bool tbv_qp_has_dest_qp(const struct tbv_qp *tqp)
@@ -1918,6 +1961,13 @@ static void tbv_qp_unbind_rail(struct tbv_qp *tqp)
 	if (!tqp->rail)
 		return;
 
+	if (tqp->backend == TBV_BACKEND_APPLE && tqp->owner) {
+		mutex_lock(&tqp->owner->lock);
+		if (tqp->rail->apple_active_qp == tqp)
+			tqp->rail->apple_active_qp = NULL;
+		mutex_unlock(&tqp->owner->lock);
+	}
+
 	if (tqp->rail_binding_counted) {
 		atomic_dec(&tqp->rail->native_qp_bind_count);
 		tqp->rail_binding_counted = false;
@@ -2525,7 +2575,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	if (gsi) {
 		qpn = TBV_GSI_QPN;
 	} else {
-		qpn = tbv_alloc_qpn(state, tqp->backend);
+		qpn = tbv_alloc_qpn(state, tqp->backend, tqp->rail);
 		if (qpn < 0) {
 			ret = qpn;
 			goto err_put_rail;
@@ -2595,6 +2645,20 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	tqp->qpn_allocated = !gsi;
 	qp->qp_num = qpn;
 	init_attr->cap.max_inline_data = 0;
+	if (tbv_backend_is_apple(tqp->backend)) {
+		mutex_lock(&state->lock);
+		if (tqp->rail->apple_active_qp) {
+			mutex_unlock(&state->lock);
+			kvfree(tqp->apple_pending);
+			kfree(tqp->recvq);
+			ida_free(&tbv_qpn_ida, qpn);
+			tqp->qpn_allocated = false;
+			ret = -EBUSY;
+			goto err_put_rail;
+		}
+		tqp->rail->apple_active_qp = tqp;
+		mutex_unlock(&state->lock);
+	}
 	if (!gsi) {
 		xa_lock_irqsave(&tqp->owner->verbs_qps_xa, flags);
 		ret = __xa_insert(&tqp->owner->verbs_qps_xa, qpn, tqp,
@@ -4040,9 +4104,26 @@ static int tbv_copy_send_range(const struct tbv_send_segment *segs, int nsegs,
 			seg_off = offset - skipped;
 
 		chunk = min_t(u32, seg->length - seg_off, length - copied);
+		if (seg->mr->umem->is_dmabuf) {
+			ret = dma_buf_begin_cpu_access(
+				to_ib_umem_dmabuf(seg->mr->umem)->attach->dmabuf,
+				DMA_FROM_DEVICE);
+			if (ret)
+				return ret;
+		}
+
 		ret = ib_umem_copy_from((u8 *)dst + copied, seg->mr->umem,
 					seg->addr + seg_off - seg->mr->start,
 					chunk);
+		if (seg->mr->umem->is_dmabuf) {
+			int end_ret;
+
+			end_ret = dma_buf_end_cpu_access(
+				to_ib_umem_dmabuf(seg->mr->umem)->attach->dmabuf,
+				DMA_FROM_DEVICE);
+			if (!ret)
+				ret = end_ret;
+		}
 		if (ret)
 			return ret;
 		copied += chunk;
@@ -5698,11 +5779,12 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 	else
 		atomic64_inc(&state->apple_rx_eof_other);
 
-	tqp = tbv_qp_get_by_num(state, qpn);
+	tqp = tbv_qp_get_apple_by_path(state, path);
 	if (!tqp) {
 		atomic64_inc(&state->data_rx_no_qp);
 		return;
 	}
+	qpn = tqp->base.qp_num;
 
 	/*
 	 * macOS emits short single-frame SENDs as EOF=3 without SOF. Treat
@@ -6530,10 +6612,14 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 			    size_t len)
 {
 	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
+	struct scatterlist *sg;
 	size_t offset;
-	size_t copied;
+	size_t copied = 0;
 	u64 mr_end;
 	u64 end;
+	unsigned int i;
+	int ret;
+	int end_ret;
 
 	if (!len)
 		return 0;
@@ -6547,9 +6633,61 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 		return -EFAULT;
 
 	offset = ib_umem_offset(mr->umem) + addr - mr->start;
-	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
-				      offset);
-	return copied == len ? 0 : -EFAULT;
+	if (!mr->umem->is_dmabuf) {
+		copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents,
+					      src, len, offset);
+		return copied == len ? 0 : -EFAULT;
+	}
+
+	ret = dma_buf_begin_cpu_access(to_ib_umem_dmabuf(mr->umem)->attach->dmabuf,
+				       DMA_TO_DEVICE);
+	if (ret)
+		return ret;
+
+	for_each_sgtable_sg(sgt, sg, i) {
+		size_t seg_len = sg->length;
+		size_t seg_off;
+
+		if (offset >= seg_len) {
+			offset -= seg_len;
+			continue;
+		}
+
+		seg_off = sg->offset + offset;
+		seg_len -= offset;
+		offset = 0;
+
+		while (seg_len && copied < len) {
+			struct page *page;
+			size_t page_off = offset_in_page(seg_off);
+			size_t chunk = min_t(size_t, PAGE_SIZE - page_off,
+					     seg_len);
+			void *kaddr;
+
+			chunk = min_t(size_t, chunk, len - copied);
+			page = pfn_to_page(page_to_pfn(sg_page(sg)) +
+					   (seg_off >> PAGE_SHIFT));
+			kaddr = kmap_local_page(page);
+			memcpy((u8 *)kaddr + page_off, (const u8 *)src + copied,
+			       chunk);
+			flush_dcache_page(page);
+			kunmap_local(kaddr);
+
+			copied += chunk;
+			seg_off += chunk;
+			seg_len -= chunk;
+		}
+
+		if (copied == len)
+			break;
+	}
+
+	ret = copied == len ? 0 : -EFAULT;
+	end_ret = dma_buf_end_cpu_access(to_ib_umem_dmabuf(mr->umem)->attach->dmabuf,
+					 DMA_TO_DEVICE);
+	if (!ret)
+		ret = end_ret;
+	return ret;
 }
 
 static int tbv_umem_copy_to_iova(struct tbv_mr *mr, u64 iova,
@@ -6602,6 +6740,7 @@ static int tbv_umem_copy_from_iova(struct tbv_mr *mr, u64 iova,
 {
 	u64 addr;
 	int ret;
+	int end_ret;
 
 	if (!len)
 		return 0;
@@ -6609,7 +6748,22 @@ static int tbv_umem_copy_from_iova(struct tbv_mr *mr, u64 iova,
 	if (ret)
 		return ret;
 
-	return ib_umem_copy_from(dst, mr->umem, addr - mr->start, len);
+	if (mr->umem->is_dmabuf) {
+		ret = dma_buf_begin_cpu_access(to_ib_umem_dmabuf(mr->umem)->attach->dmabuf,
+					       DMA_FROM_DEVICE);
+		if (ret)
+			return ret;
+	}
+
+	ret = ib_umem_copy_from(dst, mr->umem, addr - mr->start, len);
+	if (mr->umem->is_dmabuf) {
+		end_ret = dma_buf_end_cpu_access(to_ib_umem_dmabuf(mr->umem)->attach->dmabuf,
+						 DMA_FROM_DEVICE);
+		if (!ret)
+			ret = end_ret;
+	}
+
+	return ret;
 }
 
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
@@ -9120,31 +9274,19 @@ static struct ib_mr *tbv_get_dma_mr(struct ib_pd *pd, int access)
 	return &mr->base;
 }
 
-static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
-				     u64 virt_addr, int access,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-				     struct ib_dmah *dmah,
-#endif
-				     struct ib_udata *udata)
+static struct ib_mr *tbv_reg_mr_from_umem(struct ib_pd *pd,
+					  struct ib_umem *umem,
+					  u64 start, u64 length,
+					  u64 virt_addr, int access)
 {
 	struct tbv_mr *mr;
 	int ret;
-
-	if (!length)
-		return ERR_PTR(-EINVAL);
 
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
-	mr->umem = ib_umem_get(pd->device, start, length, access);
-	if (IS_ERR(mr->umem)) {
-		struct ib_umem *umem = mr->umem;
-
-		kfree(mr);
-		return ERR_CAST(umem);
-	}
-
+	mr->umem = umem;
 	mr->base.type = IB_MR_TYPE_USER;
 	mr->base.iova = virt_addr;
 	mr->base.length = length;
@@ -9154,11 +9296,64 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	mr->access = access;
 	ret = tbv_mr_publish(mr, pd);
 	if (ret) {
-		ib_umem_release(mr->umem);
+		ib_umem_release(umem);
 		kfree(mr);
 		return ERR_PTR(ret);
 	}
+
 	return &mr->base;
+}
+
+static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+				     u64 virt_addr, int access,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+				     struct ib_dmah *dmah,
+#endif
+				     struct ib_udata *udata)
+{
+	struct ib_umem *umem;
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+
+	umem = ib_umem_get(pd->device, start, length, access);
+	if (IS_ERR(umem))
+		return ERR_CAST(umem);
+
+	return tbv_reg_mr_from_umem(pd, umem, start, length, virt_addr, access);
+}
+
+static struct ib_mr *tbv_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset,
+					    u64 length, u64 virt_addr,
+					    int fd, int access,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+					    struct ib_dmah *dmah,
+#endif
+					    struct uverbs_attr_bundle *attrs)
+{
+	struct tbv_ibdev *dev = tbv_to_ibdev(pd->device);
+	struct device *dma_device = dev->base.dev.parent;
+	struct ib_umem_dmabuf *umem_dmabuf;
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+	if (!tbv_dma_device_ready(dma_device))
+		return ERR_PTR(-ENODEV);
+
+	umem_dmabuf = ib_umem_dmabuf_get_pinned_with_dma_device(
+		pd->device, dma_device, offset, length, fd, access);
+	if (IS_ERR(umem_dmabuf)) {
+		pr_info_ratelimited("dmabuf MR pinned import failed device=%s dma_device=%s fd=%d offset=%llu length=%llu err=%ld\n",
+				    dev_name(&pd->device->dev),
+				    dma_device ? dev_name(dma_device) : "<none>",
+				    fd, (unsigned long long)offset,
+				    (unsigned long long)length,
+				    PTR_ERR(umem_dmabuf));
+		return ERR_CAST(umem_dmabuf);
+	}
+
+	return tbv_reg_mr_from_umem(pd, &umem_dmabuf->umem, virt_addr, length,
+				    virt_addr, access);
 }
 
 static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
@@ -9212,6 +9407,7 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 	.poll_cq = tbv_poll_cq,
 	.req_notify_cq = tbv_req_notify_cq,
 	.reg_user_mr = tbv_reg_user_mr,
+	.reg_user_mr_dmabuf = tbv_reg_user_mr_dmabuf,
 	.dereg_mr = tbv_dereg_mr,
 
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, tbv_ucontext, base),

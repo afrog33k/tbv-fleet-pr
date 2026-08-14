@@ -32,6 +32,8 @@ CSV_FIELDS = [
     "receiver_gid_index",
     "sender_gid_index",
     "size_bytes",
+    "receiver_size_bytes",
+    "sender_size_bytes",
     "count",
     "send_depth",
     "send_slots",
@@ -235,7 +237,8 @@ def run_case(
     sender_dev: str,
     receiver_gid_index: int,
     sender_gid_index: int,
-    size: int,
+    receiver_size: int,
+    sender_size: int,
     send_depth: int,
     mtu: int,
     repeat_index: int,
@@ -254,11 +257,13 @@ def run_case(
         connect_host = receiver
     log_prefix = f"{safe_name(args.tag)}-" if args.tag else ""
     receiver_log = log_dir / (
-        f"{log_prefix}{direction}-port{port}-size{size}-sd{send_depth}-mtu{mtu}-"
+        f"{log_prefix}{direction}-port{port}-rsize{receiver_size}-ssize{sender_size}-"
+        f"sd{send_depth}-mtu{mtu}-"
         f"rep{repeat_index}-recv.log"
     )
     sender_log = log_dir / (
-        f"{log_prefix}{direction}-port{port}-size{size}-sd{send_depth}-mtu{mtu}-"
+        f"{log_prefix}{direction}-port{port}-rsize{receiver_size}-ssize{sender_size}-"
+        f"sd{send_depth}-mtu{mtu}-"
         f"rep{repeat_index}-send.log"
     )
 
@@ -268,7 +273,7 @@ def run_case(
         dev=receiver_dev,
         gid_index=receiver_gid_index,
         port=port,
-        size=size,
+        size=receiver_size,
         count=args.count,
         depth=args.recv_depth,
         recv_posts=args.recv_posts,
@@ -282,7 +287,7 @@ def run_case(
         dev=sender_dev,
         gid_index=sender_gid_index,
         port=port,
-        size=size,
+        size=sender_size,
         count=args.count,
         depth=send_depth,
         send_slots=args.send_slots or None,
@@ -351,7 +356,9 @@ def run_case(
         "sender_dev": sender_dev,
         "receiver_gid_index": str(receiver_gid_index),
         "sender_gid_index": str(sender_gid_index),
-        "size_bytes": str(size),
+        "size_bytes": str(sender_size),
+        "receiver_size_bytes": str(receiver_size),
+        "sender_size_bytes": str(sender_size),
         "count": str(args.count),
         "send_depth": str(send_depth),
         "send_slots": str(args.send_slots or send_depth),
@@ -417,6 +424,18 @@ def main() -> int:
     parser.add_argument("--tag", default="")
     parser.add_argument("--directions", choices=["forward", "reverse", "both"], default="forward")
     parser.add_argument("--sizes", type=parse_csv_ints, default=parse_csv_ints("32768"))
+    parser.add_argument(
+        "--receiver-sizes",
+        type=parse_csv_ints,
+        default=[],
+        help="Optional comma-separated receive SGE sizes. Must pair with --sender-sizes.",
+    )
+    parser.add_argument(
+        "--sender-sizes",
+        type=parse_csv_ints,
+        default=[],
+        help="Optional comma-separated SEND sizes. Must pair with --receiver-sizes.",
+    )
     parser.add_argument("--send-depths", type=parse_csv_ints, default=parse_csv_ints("16,32,64"))
     parser.add_argument("--send-slots", type=int, default=0)
     parser.add_argument("--recv-depth", type=int, default=64)
@@ -445,6 +464,17 @@ def main() -> int:
         die("--send-depths must be positive")
     if args.send_slots < 0:
         die("--send-slots must be non-negative")
+    if bool(args.receiver_sizes) != bool(args.sender_sizes):
+        die("--receiver-sizes and --sender-sizes must be passed together")
+    if args.receiver_sizes and len(args.receiver_sizes) != len(args.sender_sizes):
+        die("--receiver-sizes and --sender-sizes must have the same length")
+    if args.receiver_sizes and args.check:
+        die("mismatched size cases require --no-check")
+    size_cases = (
+        list(zip(args.receiver_sizes, args.sender_sizes))
+        if args.receiver_sizes
+        else [(size, size) for size in args.sizes]
+    )
 
     csv_path = Path(args.csv)
     log_dir = Path(args.log_dir) if args.log_dir else csv_path.with_suffix("")
@@ -509,7 +539,7 @@ def main() -> int:
             receiver_gid,
             sender_gid,
         ) in directions:
-            for size in args.sizes:
+            for receiver_size, sender_size in size_cases:
                 for mtu in args.mtus:
                     for send_depth in args.send_depths:
                         for repeat in range(1, args.repeats + 1):
@@ -517,7 +547,8 @@ def main() -> int:
                             port = args.base_port + run_index
                             print(
                                 "tbv-uc-stress: "
-                                f"{direction} size={size} send_depth={send_depth} "
+                                f"{direction} recv_size={receiver_size} "
+                                f"send_size={sender_size} send_depth={send_depth} "
                                 f"recv_posts={args.recv_posts} mtu={mtu} "
                                 f"repeat={repeat}/{args.repeats}",
                                 flush=True,
@@ -531,7 +562,8 @@ def main() -> int:
                                 sender_dev=sender_dev,
                                 receiver_gid_index=receiver_gid,
                                 sender_gid_index=sender_gid,
-                                size=size,
+                                receiver_size=receiver_size,
+                                sender_size=sender_size,
                                 send_depth=send_depth,
                                 mtu=mtu,
                                 repeat_index=repeat,
