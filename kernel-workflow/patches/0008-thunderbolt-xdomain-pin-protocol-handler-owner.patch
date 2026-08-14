@@ -15,64 +15,37 @@ field to struct tb_protocol_handler and take a temporary module reference
 while dispatching. In-flight handlers then make rmmod fail cleanly instead
 of letting module memory disappear underneath the callback.
 
-Signed-off-by: georgewhewell <georgerw@gmail.com>
+Rebased for v7.2-rc7.
 ---
- drivers/thunderbolt/xdomain.c | 6 ++++++
- include/linux/thunderbolt.h   | 5 +++++
- 2 files changed, 11 insertions(+)
-
 diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
-index d1d11f256ee1..d45f03207804 100644
+index c1396125e..75f3ea29c 100644
 --- a/drivers/thunderbolt/xdomain.c
 +++ b/drivers/thunderbolt/xdomain.c
-@@ -2627,6 +2627,9 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+@@ -2654,10 +2654,15 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
  			continue;
  
- 		matched = true;
+ 		mutex_unlock(&xdomain_lock);
 +		if (handler->owner && !try_module_get(handler->owner))
 +			continue;
 +
- 		mutex_unlock(&xdomain_lock);
  		if (handler->callback_xd)
- 			ret = handler->callback_xd(source_xd, buf, size,
-@@ -2635,6 +2638,9 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 			ret = handler->callback_xd(source_xd, buf, size, handler->data);
+ 		else
  			ret = handler->callback(buf, size, handler->data);
- 		mutex_lock(&xdomain_lock);
- 
 +		if (handler->owner)
 +			module_put(handler->owner);
-+
+ 		mutex_lock(&xdomain_lock);
+ 
  		if (ret)
- 			break;
- 	}
 diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
-index f98f2c337918..46984409d5de 100644
+index 55b5632fa..a6a7875d9 100644
 --- a/include/linux/thunderbolt.h
 +++ b/include/linux/thunderbolt.h
-@@ -370,6 +370,8 @@ int tb_xdomain_request(struct tb_xdomain *xd, const void *request,
-  *	      by this handler and should not be forwared to other
-  *	      handlers.
-  * @callback_xd: Like @callback, but also receives the source XDomain.
-+ * @owner: Optional module that owns the callback. If set, XDomain core
-+ *	   pins it while dispatching to avoid unload races.
-  * @data: Data passed with the callback
-  * @list: Handlers are linked using this
-  *
-@@ -382,11 +384,14 @@ int tb_xdomain_request(struct tb_xdomain *xd, const void *request,
-  * directed to the service the driver implements.
-  */
- #define TB_PROTOCOL_HANDLER_HAS_XDOMAIN 1
-+#define TB_PROTOCOL_HANDLER_HAS_OWNER 1
-+struct module;
- struct tb_protocol_handler {
- 	const uuid_t *uuid;
+@@ -387,6 +387,7 @@ struct tb_protocol_handler {
  	int (*callback)(const void *buf, size_t size, void *data);
- 	int (*callback_xd)(struct tb_xdomain *xd, const void *buf, size_t size,
- 			   void *data);
-+	struct module *owner;
+ 	int (*callback_xd)(struct tb_xdomain *xd, const void *buf, size_t size, void *data);
  	void *data;
++	struct module *owner;
  	struct list_head list;
  };
--- 
-2.53.0
-
+ 

@@ -17,25 +17,13 @@ removing a handler from the list.  After tb_unregister_protocol_handler()
 returns, the caller can free handler-owned callback data without a separate
 delay or driver-private grace period.
 
-Signed-off-by: georgewhewell <georgerw@gmail.com>
+Rebased for v7.2-rc7.
 ---
- drivers/thunderbolt/xdomain.c | 15 +++++++++++++++
- include/linux/thunderbolt.h   |  1 +
- 2 files changed, 16 insertions(+)
-
 diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
-index ccc04a2..09a0ef4 100644
+index 75f3ea29c..7d3e7b351 100644
 --- a/drivers/thunderbolt/xdomain.c
 +++ b/drivers/thunderbolt/xdomain.c
-@@ -7,6 +7,7 @@
-  *          Mika Westerberg <mika.westerberg@linux.intel.com>
-  */
- 
-+#include <linux/atomic.h>
- #include <linux/device.h>
- #include <linux/delay.h>
- #include <linux/kmod.h>
-@@ -17,6 +18,7 @@
+@@ -16,6 +16,7 @@
  #include <linux/string_helpers.h>
  #include <linux/utsname.h>
  #include <linux/uuid.h>
@@ -43,7 +31,7 @@ index ccc04a2..09a0ef4 100644
  #include <linux/workqueue.h>
  
  #include "tb.h"
-@@ -76,6 +78,8 @@ static u32 xdomain_property_block_gen;
+@@ -76,6 +77,8 @@ static u32 xdomain_property_block_gen;
  
  /* Additional protocol handlers */
  static LIST_HEAD(protocol_handlers);
@@ -52,7 +40,7 @@ index ccc04a2..09a0ef4 100644
  
  /* UUID for XDomain discovery protocol: b638d70e-42ff-40bb-97c2-90e2c0b2ff07 */
  static const uuid_t tb_xdp_uuid =
-@@ -701,6 +705,8 @@ void tb_unregister_protocol_handler(struct tb_protocol_handler *handler)
+@@ -642,6 +645,8 @@ void tb_unregister_protocol_handler(struct tb_protocol_handler *handler)
  	mutex_lock(&xdomain_lock);
  	list_del_init(&handler->list);
  	mutex_unlock(&xdomain_lock);
@@ -61,34 +49,22 @@ index ccc04a2..09a0ef4 100644
  }
  EXPORT_SYMBOL_GPL(tb_unregister_protocol_handler);
  
-@@ -2702,6 +2708,7 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
- 	route = ((u64)hdr->xd_hdr.route_hi << 32 | hdr->xd_hdr.route_lo) &
- 		~BIT_ULL(63);
- 	source_xd = tb_xdomain_find_by_route_locked(tb, route);
-+	atomic_inc(&protocol_dispatch_active);
+@@ -2645,6 +2650,8 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 		return false;
+ 	}
  
- 	mutex_lock(&xdomain_lock);
- 	list_for_each_entry_safe(handler, tmp, &protocol_handlers, list) {
-@@ -2731,6 +2738,9 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
++	atomic_inc(&protocol_dispatch_active);
++
+ 	route = ((u64)hdr->xd_hdr.route_hi << 32 | hdr->xd_hdr.route_lo) & ~BIT_ULL(63);
+ 	source_xd = tb_xdomain_find_by_route_locked(tb, route);
+ 
+@@ -2670,6 +2677,9 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
  	}
  	mutex_unlock(&xdomain_lock);
  
 +	if (atomic_dec_and_test(&protocol_dispatch_active))
 +		wake_up_all(&protocol_dispatch_wait);
 +
- 	if (!matched) {
- 		const u32 *w = buf;
- 		size_t n = size / 4;
-diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
-index 4698440..40cb20e 100644
---- a/include/linux/thunderbolt.h
-+++ b/include/linux/thunderbolt.h
-@@ -385,5 +385,6 @@ int tb_xdomain_request(struct tb_xdomain *xd, const void *request,
- #define TB_PROTOCOL_HANDLER_HAS_XDOMAIN 1
- #define TB_PROTOCOL_HANDLER_HAS_OWNER 1
-+#define TB_PROTOCOL_HANDLER_UNREGISTER_DRAINS 1
- struct module;
- struct tb_protocol_handler {
- 	const uuid_t *uuid;
--- 
-2.54.0
+ 	if (source_xd)
+ 		tb_xdomain_put(source_xd);
+ 

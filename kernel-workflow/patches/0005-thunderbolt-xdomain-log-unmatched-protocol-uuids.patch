@@ -15,32 +15,30 @@ Informational only -- packet handling is unchanged.
 
 Used to discover Apple AD/FA57 control-packet UUIDs.
 
-Signed-off-by: georgewhewell <georgerw@gmail.com>
+Rebased for v7.2-rc7 against the post-0010 dispatch shape (source_xd
+and callback_xd already added by 0007/0008/0010).
 ---
- drivers/thunderbolt/xdomain.c | 14 ++++++++++++++
- 1 file changed, 14 insertions(+)
-
 diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
-index 781d88d06b93..322e243fa7d9 100644
+index 7d3e7b351..f183b92d6 100644
 --- a/drivers/thunderbolt/xdomain.c
 +++ b/drivers/thunderbolt/xdomain.c
-@@ -2594,6 +2594,7 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
- 	const struct tb_protocol_handler *handler, *tmp;
- 	const struct tb_xdp_header *hdr = buf;
+@@ -2630,6 +2630,7 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
  	unsigned int length;
+ 	struct tb_xdomain *source_xd = NULL;
+ 	u64 route;
 +	bool matched = false;
  	int ret = 0;
  
  	/* We expect the packet is at least size of the header */
-@@ -2619,6 +2620,7 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
- 		if (!uuid_equal(&hdr->uuid, handler->uuid))
+@@ -2664,6 +2665,7 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 		if (handler->owner && !try_module_get(handler->owner))
  			continue;
  
 +		matched = true;
- 		mutex_unlock(&xdomain_lock);
- 		ret = handler->callback(buf, size, handler->data);
- 		mutex_lock(&xdomain_lock);
-@@ -2628,6 +2630,18 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 		if (handler->callback_xd)
+ 			ret = handler->callback_xd(source_xd, buf, size, handler->data);
+ 		else
+@@ -2677,6 +2679,18 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
  	}
  	mutex_unlock(&xdomain_lock);
  
@@ -56,9 +54,6 @@ index 781d88d06b93..322e243fa7d9 100644
 +				    n > 6 ? w[6] : 0, n > 7 ? w[7] : 0);
 +	}
 +
- 	return ret > 0;
- }
+ 	if (atomic_dec_and_test(&protocol_dispatch_active))
+ 		wake_up_all(&protocol_dispatch_wait);
  
--- 
-2.53.0
-
