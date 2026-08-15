@@ -95,6 +95,13 @@ struct tbv_data_frame {
 	tbv_path_tx_done_fn done;
 	void *done_ctx;
 	bool tx;
+	/* zcopy_rx-only: one-shot frame that DMAs the wire payload
+	 * directly into an MR page, no kernel bounce buffer. Set on
+	 * the rx_path branch in tbv_path_post_rx_zcopy_frame().
+	 */
+	bool zcopy_rx;
+	struct page *zcopy_page;
+	unsigned int zcopy_page_off;
 };
 
 struct tbv_tx_packet {
@@ -751,6 +758,9 @@ static void tbv_path_rx_supp_poll_work(struct work_struct *work)
 }
 
 static int tbv_path_post_rx_frame(struct tbv_data_frame *f);
+static void tbv_path_zcopy_rx_complete(struct tb_ring *ring,
+				       struct ring_frame *frame,
+				       bool canceled);
 
 static void tbv_path_rx_start_raw(struct tbv_path *path,
 				  const struct tbv_native_data_header *hdr)
@@ -1155,6 +1165,84 @@ static int tbv_path_post_rx_frame(struct tbv_data_frame *f)
 	dma_sync_single_for_device(tb_ring_dma_device(path->rx_ring), f->dma,
 				   TBV_DATA_FRAME_SIZE, DMA_FROM_DEVICE);
 	return tb_ring_rx(path->rx_ring, &f->frame);
+}
+
+int tbv_path_post_rx_zcopy_frame(struct tbv_path *path,
+				 struct page *page, unsigned int page_off,
+				 u32 len, void *done_ctx)
+{
+	struct tbv_data_frame *f;
+	struct device *dma_dev;
+	dma_addr_t dma;
+
+	if (!path || !path->rx_ring || !page)
+		return -EINVAL;
+
+	dma_dev = tb_ring_dma_device(path->rx_ring);
+	if (!tbv_dma_device_ready(dma_dev))
+		return -EIO;
+
+	if (page_off + len > PAGE_SIZE)
+		return -EINVAL;
+
+	f = kzalloc(sizeof(*f), GFP_KERNEL);
+	if (!f)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&f->frame.list);
+	INIT_LIST_HEAD(&f->free_node);
+	f->path = path;
+	f->tx = false;
+	f->zcopy_rx = true;
+	f->buf = NULL;
+	f->zcopy_page = page;
+	f->zcopy_page_off = page_off;
+	f->done = tbv_rx_zcopy_complete;
+	f->done_ctx = done_ctx;
+
+	dma = dma_map_page(dma_dev, page, page_off, len, DMA_FROM_DEVICE);
+	if (dma_mapping_error(dma_dev, dma)) {
+		kfree(f);
+		return -EIO;
+	}
+	f->dma = dma;
+	f->frame.buffer_phy = dma;
+	f->frame.size = len;
+	f->frame.flags = 0;
+	f->frame.sof = 0;
+	f->frame.eof = 0;
+	f->frame.callback = tbv_path_zcopy_rx_complete;
+
+	dma_sync_single_for_device(dma_dev, dma, len, DMA_FROM_DEVICE);
+	return tb_ring_rx(path->rx_ring, &f->frame);
+}
+
+static void tbv_path_zcopy_rx_complete(struct tb_ring *ring,
+				       struct ring_frame *frame,
+				       bool canceled)
+{
+	struct tbv_data_frame *f = container_of(frame, struct tbv_data_frame,
+						frame);
+	struct tbv_path *path = f->path;
+	struct device *dma_dev = tb_ring_dma_device(ring);
+	int status = canceled ? -ECANCELED : 0;
+
+	if (tbv_dma_device_ready(dma_dev))
+		dma_unmap_page(dma_dev, f->dma, f->frame.size, DMA_FROM_DEVICE);
+
+	if (path && path->rail && path->rail->peer) {
+		struct tbv_state *state = path->rail->peer->state;
+
+		if (state) {
+			atomic64_inc(&state->data_rx_dmabuf_zcopy);
+			if (status)
+				atomic64_inc(&state->data_rx_dmabuf_zcopy_error);
+		}
+	}
+
+	if (f->done)
+		f->done(f->done_ctx, status);
+	kfree(f);
 }
 
 const char *tbv_path_state_name(enum tbv_path_state state)

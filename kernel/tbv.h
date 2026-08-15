@@ -573,6 +573,8 @@ struct tbv_state {
 	atomic64_t data_rx_rnr;
 	atomic64_t data_rx_rnr_suppressed;
 	atomic64_t data_rx_copy_error;
+	atomic64_t data_rx_dmabuf_zcopy;
+	atomic64_t data_rx_dmabuf_zcopy_error;
 	atomic64_t data_rx_send_len_error;
 	atomic64_t data_rx_send_prot_error;
 	atomic64_t data_rx_send_cq_error;
@@ -886,5 +888,9 @@ int tbv_core_init(struct tbv_state *state,
 		  const struct tbv_resolved_config *cfg,
 		  const struct tbv_tbnet_identity_config *identity_cfg);
 void tbv_core_exit(struct tbv_state *state);
+void tbv_rx_zcopy_complete(void *ctx, int status);
+int tbv_path_post_rx_zcopy_frame(struct tbv_path *path,
+				 struct page *page, unsigned int page_off,
+				 u32 len, void *done_ctx);
 
 #endif
