@@ -145,3 +145,16 @@ Three pieces in `kernel/path.c` and `kernel/ibdev.c`:
 Approve to proceed? If yes, I will start with the dmabuf-only branch
 (smallest diff, leaves CPU MRs untouched) and report back with a
 buildable module + a smoke test on strix-1.
+
+## Run book for the next experiment on strix-1 + strix-2
+
+1. **Reload the module.** `tools/tbv-target-module.sh strix-1 --booted-kernel --reload --options 'profile=linux_perf apple_data=N native_data=Y bind_services=Y allocate_rings=Y start_rings=Y negotiate_native=Y enable_tunnels=Y register_verbs=Y zcopy_min_bytes=4294967295'`. Repeat for `strix-2` if the kernel is rebuilt there. Verify `/sys/class/infiniband/usb4_rdma*/ports/1/link_layer` reads `InfiniBand` (not `Ethernet`).
+2. **CPU regression first.** Run `userspace/bench/rc_write_verify` between the two nodes. Confirm `data_rx_completed` matches `data_rx_reorder_delivered` and no `data_rx_copy_error` increments in `/sys/kernel/debug/tbv/usb4_rdma*/summary`. This must pass before touching dmabuf.
+3. **dmabuf MR probe.** Open a HIP-allocated region on `strix-1`, export it via `hsa_amd_portable_export_dmabuf`, register it via `ibv_reg_dmabuf_mr` on `usb4_rdma0` (or `usb4_rdma1`). Have the peer do an RDMA WRITE into it. Confirm `data_rx_dmabuf_zcopy` (new counter) increments and `data_rx_copy_error` stays at 0.
+4. **HIP visibility probe.** Run `userspace/bench/hip_rdma_write_visibility_probe` with `--role recv --kind device --recv-reg dmabuf` on the GPU node and `--role send --kind malloc --source-fill cpu` on the peer. Compare against the `--recv-reg reg_mr` baseline. The PR-thread failure mode was `gpu_seen=0`, `data_rx_copy_error=2`. With this change we expect `gpu_seen > 0` and zero copy errors.
+5. **Failure triage.** If `data_rx_dmabuf_zcopy_error` increments, the most common cause is `dma_map_sg` returning 0 (device not IOMMU-mapped or BO not contiguous) or the SGL walk failing (`dest_iova` outside any sg entry). Both are recoverable by aborting the WRITE and pushing `IB_WC_LOC_PROT_ERR`, so the wire stays consistent.
+
+## What's still missing
+
+- The same RX-side DMA change needs to be **ported onto `codex/gda-v2-rebased-port`** (the path input the cluster actually builds from). Currently it lives only on `codex/apple-xdomain-property-match`.
+- The `nixos-config` flake.lock pin in this commit points at `codex/apple-xdomain-property-match`, but the cluster still consumes the GDA v2 rebase path input. Once the GDA branch picks up these commits, a `colmena build` will pull them in.
