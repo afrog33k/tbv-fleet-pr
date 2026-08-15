@@ -35,9 +35,19 @@ if [ "$SERVER" = "$CLIENT" ]; then
   exit 1
 fi
 
-mkdir -p "$OUT_DIR"
-
-log() { printf '[%(%Y-%m-%dT%H:%M:%SZ)T] %s\n' -1 "$*"; }
+stage_reload() {
+  log "stage=reload host=$SERVER"
+  "${BENCH_ROOT}/tools/tbv-target-module.sh" "$SERVER" --booted-kernel --reload --options 'profile=linux_perf tbnet=prefer_rdma bind_services=1' 2>&1 | tee "$OUT_DIR/reload-${SERVER}.log"
+  # Wait for the new usb4_rdma devices to register; on a clean boot the
+  # source-aware XDomain handler initialises in time, on a reload the kernel
+  # autoload path is required (which is why the doc recommends a reboot).
+  for _ in $(seq 1 30); do
+    if ssh $SSH_OPTS "$SERVER" 'test -n "$(ls /sys/class/infiniband/usb4_rdma* 2>/dev/null)"' 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+}
 
 ##############################################################################
 # Stage 1: copy + reload module on SERVER
