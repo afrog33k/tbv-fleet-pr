@@ -356,6 +356,21 @@ struct tbv_rx_reorder_msg {
 	bool complete;
 	bool with_imm;
 	bool solicited;
+	/*
+	 * RX-side DMA into a dmabuf MR. Populated on first fragment of
+	 * an RDMA WRITE that targets a dmabuf MR; released when the
+	 * last fragment completes (or the msg is dropped). refcount_t
+	 * `refs` is bumped for each in-flight zcopy frame, so the msg
+	 * stays alive until every DMA completion has been processed.
+	 * zcopy_sgt is the SGL we DMA-mapped (== mr->umem->sgt_append.sgt),
+	 * kept so we can dma_unmap_sg on teardown.
+	 */
+	struct sg_table *zcopy_sgt;
+	struct tbv_mr *zcopy_mr;
+	struct device *zcopy_dma_dev;
+	int zcopy_sgt_nents;
+	bool zcopy_mapped;
+	refcount_t refs;
 };
 
 struct tbv_apple_pending_rx {
@@ -653,6 +668,7 @@ static void tbv_rx_drop_reorder_msg_locked(struct tbv_state *state,
 static void tbv_rx_drain_reorder_locked(struct tbv_state *state,
 					struct tbv_qp *tqp,
 					struct tbv_path *rx_path);
+static void tbv_rx_zcopy_drain_work(struct work_struct *work);
 static void tbv_qp_flush_apple_pending(struct tbv_qp *tqp);
 static void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
 					      struct tbv_qp *tqp);
@@ -6964,18 +6980,46 @@ static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 	return 0;
 }
 
-static void tbv_rx_reorder_free_msg(struct tbv_rx_reorder_msg *msg)
+static void tbv_rx_reorder_msg_release(struct tbv_rx_reorder_msg *msg)
 {
 	struct tbv_rx_reorder_frag *frag;
 	struct tbv_rx_reorder_frag *tmp;
 
 	if (!msg)
 		return;
+	if (msg->zcopy_mapped) {
+		struct device *dma_dev = msg->zcopy_dma_dev;
+
+		if (dma_dev && msg->zcopy_sgt && msg->zcopy_sgt_nents > 0)
+			dma_unmap_sg(dma_dev, msg->zcopy_sgt->sgl,
+				      msg->zcopy_sgt_nents, DMA_FROM_DEVICE);
+		msg->zcopy_mapped = false;
+	}
+	if (msg->zcopy_mr) {
+		tbv_mr_put(msg->zcopy_mr);
+		msg->zcopy_mr = NULL;
+	}
 	list_for_each_entry_safe(frag, tmp, &msg->frags, node) {
 		list_del(&frag->node);
 		kfree(frag);
 	}
 	kfree(msg);
+}
+
+static void tbv_rx_reorder_msg_get(struct tbv_rx_reorder_msg *msg)
+{
+	refcount_inc(&msg->refs);
+}
+
+static void tbv_rx_reorder_msg_put(struct tbv_rx_reorder_msg *msg)
+{
+	if (refcount_dec_and_test(&msg->refs))
+		tbv_rx_reorder_msg_release(msg);
+}
+
+static void tbv_rx_reorder_free_msg(struct tbv_rx_reorder_msg *msg)
+{
+	tbv_rx_reorder_msg_put(msg);
 }
 
 static void tbv_qp_flush_reorder(struct tbv_qp *tqp)
@@ -7451,7 +7495,7 @@ static bool tbv_rx_deliver_reorder_write_locked(struct tbv_state *state,
 		atomic64_inc(&state->data_rx_copy_error);
 		status = IB_WC_LOC_PROT_ERR;
 		ret = -EACCES;
-	} else {
+	} else if (!msg->zcopy_mapped) {
 		list_for_each_entry(frag, &msg->frags, node) {
 			u64 copy_addr;
 
@@ -7680,6 +7724,7 @@ static void tbv_rx_buffer_read_req_locked(
 		}
 
 		INIT_LIST_HEAD(&msg->frags);
+		refcount_set(&msg->refs, 1);
 		msg->first_jiffies = jiffies;
 		msg->kind = TBV_RX_REORDER_READ_REQ;
 		msg->remote_addr = hdr->remote_addr;
@@ -7762,8 +7807,8 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 					      "reorder alloc failed", false);
 			return;
 		}
-
 		INIT_LIST_HEAD(&msg->frags);
+		refcount_set(&msg->refs, 1);
 		msg->first_jiffies = jiffies;
 		msg->kind = TBV_RX_REORDER_SEND;
 		msg->src_qp = hdr->src_qp;
@@ -7820,6 +7865,192 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 		tbv_rx_drain_reorder_locked(state, tqp, rx_path);
 }
 
+static bool tbv_rx_zcopy_try_lock(struct tbv_state *state,
+				  struct tbv_qp *tqp,
+				  struct tbv_rx_reorder_msg *msg)
+{
+	struct tbv_mr *probe;
+
+	if (!state)
+		return false;
+	probe = tbv_mr_get(state, msg->rkey);
+	if (!probe)
+		return false;
+	if (!probe->umem || !probe->umem->is_dmabuf) {
+		tbv_mr_put(probe);
+		return false;
+	}
+	tbv_mr_put(probe);
+	return true;
+}
+
+
+struct tbv_rx_zcopy_frag {
+	struct work_struct work;
+	struct tbv_qp *tqp;
+	struct tbv_path *rx_path;
+	struct tbv_rx_reorder_msg *msg;
+	u32 frag_idx;
+	int status;
+};
+
+void tbv_rx_zcopy_drain_work(struct work_struct *work)
+{
+	struct tbv_rx_zcopy_frag *zf = container_of(work,
+		struct tbv_rx_zcopy_frag, work);
+	struct tbv_qp *tqp = zf->tqp;
+	struct tbv_rx_reorder_msg *msg = zf->msg;
+	struct tbv_state *state = tqp->owner;
+
+	if (zf->status)
+		tbv_rx_record_send_error(state, "dmabuf_zcopy", tqp,
+					 msg->src_qp, msg->psn,
+					 IB_WC_REM_OP_ERR, false,
+					 msg->total_len, 0,
+					 msg->received, 0, 0, 0);
+	mutex_lock(&tqp->rx_lock);
+	if (test_and_set_bit(zf->frag_idx, msg->frag_seen)) {
+		/* duplicate completion; another worker won the race */
+		mutex_unlock(&tqp->rx_lock);
+		goto out;
+	}
+	if (!zf->status)
+		msg->frags_received++;
+	if (msg->frags_received >= msg->frag_count || zf->status)
+		msg->complete = true;
+	if (msg->complete)
+		tbv_rx_drain_reorder_locked(state, tqp, zf->rx_path);
+	mutex_unlock(&tqp->rx_lock);
+
+out:
+	tbv_rx_reorder_msg_put(msg);
+	kfree(zf);
+}
+
+void tbv_rx_zcopy_complete(void *ctx, int status)
+{
+	struct tbv_rx_zcopy_frag *zf = ctx;
+	struct workqueue_struct *wq;
+
+	if (!zf)
+		return;
+	zf->status = status;
+	wq = (zf->tqp->owner && zf->tqp->owner->workqueue) ?
+		zf->tqp->owner->workqueue : system_unbound_wq;
+	if (!queue_work(wq, &zf->work))
+		tbv_rx_zcopy_drain_work(&zf->work);
+}
+
+static int tbv_rx_zcopy_prepare_msg(struct tbv_state *state,
+				    struct tbv_path *rx_path,
+				    struct tbv_qp *tqp,
+				    struct tbv_rx_reorder_msg *msg)
+{
+	struct tbv_mr *mr;
+	struct device *dma_dev;
+	struct sg_table *sgt;
+	int n;
+
+	if (!state || !rx_path || !rx_path->rx_ring)
+		return -EIO;
+	dma_dev = tb_ring_dma_device(rx_path->rx_ring);
+	if (!tbv_dma_device_ready(dma_dev))
+		return -EIO;
+	mr = tbv_mr_get(state, msg->rkey);
+	if (!mr)
+		return -EINVAL;
+	if (!mr->umem) {
+		tbv_mr_put(mr);
+		return -EINVAL;
+	}
+	sgt = &mr->umem->sgt_append.sgt;
+	n = dma_map_sg_attrs(dma_dev, sgt->sgl, sgt->orig_nents,
+			     DMA_FROM_DEVICE, 0);
+	if (n <= 0) {
+		tbv_mr_put(mr);
+		return -EIO;
+	}
+	msg->zcopy_mr = mr;
+	msg->zcopy_sgt = sgt;
+	msg->zcopy_dma_dev = dma_dev;
+	msg->zcopy_sgt_nents = n;
+	msg->zcopy_mapped = true;
+	return 0;
+}
+
+static int tbv_rx_zcopy_post_fragment(struct tbv_qp *tqp,
+				      struct tbv_path *rx_path,
+				      struct tbv_rx_reorder_msg *msg,
+				      u32 frag_idx, u32 frag_offset,
+				      u32 frag_len, u32 psn)
+{
+	struct sg_table *sgt = msg->zcopy_sgt;
+	struct scatterlist *sg = NULL;
+	unsigned int i;
+	u64 sg_iova_base;
+	u64 dest_iova;
+	struct page *page;
+	unsigned int page_off;
+	struct tbv_rx_zcopy_frag *zf;
+	int ret;
+
+	if (check_add_overflow(msg->remote_addr, (u64)frag_offset, &dest_iova))
+		return -EINVAL;
+
+	/* Find the SGL entry that contains dest_iova. The map already
+	 * arranged the SGL in place, but the per-entry IOVA is not
+	 * stored on the SGL itself for non-DMA-bus-mapped regions. We
+	 * rely on the wire remote_addr + frag_offset being a linear
+	 * range within the MR, and the MR's page layout being
+	 * page-aligned with frag_off fitting in one page. Walk the
+	 * SGL until cumulative length >= frag_len.
+	 */
+	sg_iova_base = msg->remote_addr;
+	for_each_sgtable_sg(sgt, sg, i) {
+		size_t sg_len = sg_dma_len(sg);
+
+		if (!sg_len)
+			continue;
+		if (dest_iova < sg_iova_base + sg_len &&
+		    dest_iova + frag_len <= sg_iova_base + sg_len)
+			break;
+		sg_iova_base += sg_len;
+	}
+	if (!sg)
+		return -EINVAL;
+
+	page = sg_page(sg);
+	page_off = (unsigned int)(dest_iova & (PAGE_SIZE - 1));
+	if (page_off + frag_len > PAGE_SIZE)
+		return -EINVAL;
+
+	zf = kzalloc(sizeof(*zf), GFP_KERNEL);
+	if (!zf)
+		return -ENOMEM;
+	INIT_WORK(&zf->work, tbv_rx_zcopy_drain_work);
+	zf->tqp = tqp;
+	zf->rx_path = rx_path;
+	zf->msg = msg;
+	zf->frag_idx = frag_idx;
+	tbv_rx_reorder_msg_get(msg);
+
+	ret = tbv_path_post_rx_zcopy_frame(rx_path, page, page_off, frag_len,
+					   zf);
+	if (ret) {
+		tbv_rx_reorder_msg_put(msg);
+		kfree(zf);
+		return ret;
+	}
+	/*
+	 * Account the bytes now (in submit order); the DMA completion
+	 * bumps frags_received / runs drain. If the DMA later errors
+	 * we still want the byte accounting to be right for error logs.
+	 */
+	msg->received += frag_len;
+	return 0;
+}
+
+
 static void tbv_rx_buffer_write_fragment_locked(
 	struct tbv_state *state, struct tbv_qp *tqp, struct tbv_path *rx_path,
 	const struct tbv_native_data_header *hdr, u32 psn, u32 total_len,
@@ -7870,6 +8101,7 @@ static void tbv_rx_buffer_write_fragment_locked(
 		}
 
 		INIT_LIST_HEAD(&msg->frags);
+		refcount_set(&msg->refs, 1);
 		msg->first_jiffies = jiffies;
 		msg->kind = TBV_RX_REORDER_WRITE;
 		msg->remote_addr = hdr->remote_addr;
@@ -7885,6 +8117,11 @@ static void tbv_rx_buffer_write_fragment_locked(
 		tqp->rx_reorder_count++;
 		atomic64_inc(&state->data_rx_reorder_buffered);
 		tbv_qp_schedule_timeout(tqp);
+
+		if (last) {
+			tbv_rx_drain_reorder_locked(state, tqp, rx_path);
+			return;
+		}
 	} else if (msg->kind != TBV_RX_REORDER_WRITE ||
 		   msg->src_qp != hdr->src_qp ||
 		   msg->remote_addr != hdr->remote_addr ||
@@ -7898,17 +8135,32 @@ static void tbv_rx_buffer_write_fragment_locked(
 				     psn, TBV_NATIVE_SEND_ACK_ERROR);
 		return;
 	} else if (test_bit(frag_idx, msg->frag_seen)) {
-		if (!tbv_rx_reorder_fragment_matches_locked(msg, offset,
-							    payload,
-							    hdr->length)) {
+		if (msg->complete)
+			tbv_rx_drain_reorder_locked(state, tqp, rx_path);
+		return;
+	}
+
+	if (msg->zcopy_mapped || tbv_rx_zcopy_try_lock(state, tqp, msg)) {
+		if (!msg->zcopy_mapped) {
+			ret = tbv_rx_zcopy_prepare_msg(state, rx_path, tqp, msg);
+			if (ret) {
+				tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+				tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
+						     hdr->dest_qp, psn,
+						     TBV_NATIVE_SEND_ACK_ERROR);
+				return;
+			}
+		}
+		ret = tbv_rx_zcopy_post_fragment(tqp, rx_path, msg, frag_idx,
+						offset, hdr->length, psn);
+		if (ret) {
 			tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+			atomic64_inc(&state->data_rx_dmabuf_zcopy_error);
 			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, psn,
 					     TBV_NATIVE_SEND_ACK_ERROR);
 			return;
 		}
-		if (msg->complete)
-			tbv_rx_drain_reorder_locked(state, tqp, rx_path);
 		return;
 	}
 
@@ -7930,6 +8182,7 @@ static void tbv_rx_buffer_write_fragment_locked(
 	if (msg->complete)
 		tbv_rx_drain_reorder_locked(state, tqp, rx_path);
 }
+
 
 static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 					struct tbv_qp *tqp,
@@ -9316,7 +9569,11 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	if (!length)
 		return ERR_PTR(-EINVAL);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	umem = ib_umem_get_va(pd->device, start, length, access);
+#else
 	umem = ib_umem_get(pd->device, start, length, access);
+#endif
 	if (IS_ERR(umem))
 		return ERR_CAST(umem);
 
