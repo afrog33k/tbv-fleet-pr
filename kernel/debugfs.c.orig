@@ -1,102 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/debugfs.h>
-#include <linux/io.h>
 #include <linux/seq_file.h>
 #include <linux/thunderbolt.h>
-#include <linux/version.h>
 
 #include "../proto/native_wire.h"
 #include "tbv.h"
-#include "ring_diag.h"
-
-/* Read-only diagnostic for the Linux 6.18 PCI NHI ABI, never Apple NHI. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0) && \
-    LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
-struct tbv_diag_desc {
-	u64 phys;
-	u32 ctrl;
-	u32 time;
-} __packed;
-
-static void tbv_debugfs_ring_show(struct seq_file *s, struct tb_ring *ring,
-				const char *direction)
-{
-	struct {
-		bool running, hw_valid, tail_valid, throttle_valid;
-		int head, tail, size, hop, irq, e2e_tx_hop;
-		unsigned int vector, flags, queued, inflight, outstanding;
-		u32 index, options, options_e2e, tail_ctrl, throttle;
-	} snap = { 0 };
-	const struct tbv_diag_desc *descs;
-	struct list_head *pos;
-	unsigned long irqflags;
-	void __iomem *base;
-
-	BUILD_BUG_ON(sizeof(struct tbv_diag_desc) != 16);
-	if (!ring) {
-		seq_printf(s, "    ring_%s present=0\n", direction);
-		return;
-	}
-	/* Caller holds state->lock: rails unlink before freeing their rings. */
-	spin_lock_irqsave(&ring->lock, irqflags);
-	snap.running = ring->running;
-	snap.head = ring->head;
-	snap.tail = ring->tail;
-	snap.size = ring->size;
-	snap.hop = ring->hop;
-	snap.irq = ring->irq;
-	snap.vector = ring->vector;
-	snap.flags = ring->flags;
-	snap.e2e_tx_hop = ring->e2e_tx_hop;
-	list_for_each(pos, &ring->queue)
-		snap.queued++;
-	list_for_each(pos, &ring->in_flight)
-		snap.inflight++;
-	if (snap.size > 0 && snap.head >= 0 && snap.head < snap.size &&
-	    snap.tail >= 0 && snap.tail < snap.size) {
-		snap.outstanding = (snap.head - snap.tail + snap.size) % snap.size;
-		descs = (const struct tbv_diag_desc *)ring->descriptors;
-		if (descs && snap.outstanding) {
-			snap.tail_ctrl = READ_ONCE(descs[snap.tail].ctrl);
-			snap.tail_valid = true;
-		}
-	}
-	if (ring->nhi && ring->nhi->pdev && ring->nhi->iobase &&
-	    snap.hop >= 0 && snap.hop < ring->nhi->hop_count) {
-		base = ring->nhi->iobase;
-		snap.index = ioread32(base + (ring->is_tx ? 0 : 0x8000) +
-				     snap.hop * 16 + 8);
-		snap.options = ioread32(base + (ring->is_tx ? 0x19800 : 0x29800) +
-				       snap.hop * 32);
-		snap.options_e2e = ioread32(base + (ring->is_tx ? 0x19800 : 0x29800) +
-					   snap.hop * 32 + 4);
-		snap.hw_valid = true;
-		if (snap.vector < 16) {
-			snap.throttle = ioread32(base + 0x38c00 + snap.vector * 4);
-			snap.throttle_valid = true;
-		}
-	}
-	spin_unlock_irqrestore(&ring->lock, irqflags);
-	seq_printf(s, "    ring_%s present=1 running=%u head=%d tail=%d size=%d hop=%d irq=%d vector=%u flags=0x%x e2e_tx_hop=%d sw_queue=%u in_flight=%u outstanding=%u hw_valid=%u hw_index=%u hw_index_raw=0x%x hw_options=0x%x hw_options_next=0x%x hw_enabled=%u hw_e2e=%u hw_e2e_hop=%u tail_valid=%u tail_ctrl=0x%x tail_flags=0x%x tail_completed=%u throttle_valid=%u throttle_raw=%u\n",
-		   direction, snap.running, snap.head, snap.tail, snap.size,
-		   snap.hop, snap.irq, snap.vector, snap.flags, snap.e2e_tx_hop,
-		   snap.queued, snap.inflight, snap.outstanding, snap.hw_valid,
-		   tbv_diag_hw_index(snap.index, ring->is_tx), snap.index,
-		   snap.options, snap.options_e2e, !!(snap.options & BIT(31)),
-		   !!(snap.options & BIT(28)), tbv_diag_e2e_hop(snap.options),
-		   snap.tail_valid, snap.tail_ctrl, tbv_diag_desc_flags(snap.tail_ctrl),
-		   !!(tbv_diag_desc_flags(snap.tail_ctrl) & RING_DESC_COMPLETED),
-		   snap.throttle_valid, snap.throttle);
-}
-#else
-static void tbv_debugfs_ring_show(struct seq_file *s, struct tb_ring *ring,
-				const char *direction)
-{
-	seq_printf(s, "    ring_%s present=%u hw_valid=0 unsupported_kernel_abi=1\n",
-		   direction, !!ring);
-}
-#endif
 
 static u32 tbv_debugfs_wire_path_flags(const struct tbv_path *path)
 {
@@ -464,6 +373,12 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->apple_rx_rail_mismatch));
 	seq_printf(s, "apple_rx_cq_overflow: %lld\n",
 		   atomic64_read(&state->apple_rx_cq_overflow));
+	seq_printf(s, "apple_rx_quarantine_dropped: %lld\n",
+		   atomic64_read(&state->apple_rx_quarantine_dropped));
+	seq_printf(s, "apple_tx_unbound: %lld\n",
+		   atomic64_read(&state->apple_tx_unbound));
+	seq_printf(s, "apple_bind_refused: %lld\n",
+		   atomic64_read(&state->apple_bind_refused));
 	seq_printf(s, "data_cq_overflow: %lld\n",
 		   atomic64_read(&state->data_cq_overflow));
 	return 0;
@@ -524,14 +439,16 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   rail->remote_tx_hop,
 				   rail->remote_rx_hop);
 			seq_printf(s,
-				   "    data_tx_enqueued=%lld data_tx_posted=%lld data_tx_completed=%lld data_tx_credit_stalls=%lld data_tx_credit_received=%lld tx_credits=%u/%u\n",
+				   "    data_tx_enqueued=%lld data_tx_posted=%lld data_tx_completed=%lld data_tx_canceled=%lld data_tx_credit_stalls=%lld data_tx_credit_received=%lld tx_credits=%u/%u\n",
 				   atomic64_read(&rail->path.data_tx_enqueued),
 				   atomic64_read(&rail->path.data_tx_posted),
 				   atomic64_read(&rail->path.data_tx_completed),
+				   atomic64_read(&rail->path.data_tx_canceled),
 				   atomic64_read(&rail->path.data_tx_credit_stalls),
 				   atomic64_read(&rail->path.data_tx_credit_received),
 				   rail->path.tx_remote_data_credits,
 				   rail->path.tx_remote_data_credit_max);
+			tbv_ibdev_debugfs_rail_show(s, rail);
 			seq_printf(s,
 				   "    control_tx_enqueued=%lld control_tx_posted=%lld control_tx_completed=%lld control_tx_queue_max_ms=%lld\n",
 				   atomic64_read(&rail->path.control_tx_enqueued),
@@ -557,17 +474,28 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   atomic64_read(&rail->path.data_rx_repost_failed),
 				   rail->path.rx_data_credit_pending);
 			seq_printf(s,
+				   "    tx_space_wait waits=%lld timeouts=%lld total_ns=%lld max_ns=%lld\n",
+				   atomic64_read(&rail->path.tx_space_waits),
+				   atomic64_read(&rail->path.tx_space_wait_timeouts),
+				   atomic64_read(&rail->path.tx_space_wait_ns),
+				   atomic64_read(&rail->path.tx_space_wait_max_ns));
+			seq_printf(s,
 				   "    tx_poll enabled=%u calls=%lld completed=%lld\n",
 				   rail->path.tx_poll_enabled,
 				   atomic64_read(&rail->path.tx_poll_calls),
 				   atomic64_read(&rail->path.tx_poll_completed));
-			tbv_debugfs_ring_show(s, rail->path.tx_ring, "tx");
-			tbv_debugfs_ring_show(s, rail->path.rx_ring, "rx");
 			seq_printf(s,
 				   "    rx_supp_poll enabled=%u calls=%lld completed=%lld\n",
 				   rail->path.rx_supp_poll_enabled,
 				   atomic64_read(&rail->path.rx_supp_poll_calls),
 				   atomic64_read(&rail->path.rx_supp_poll_completed));
+			tbv_path_show_apple_throttle(s, &rail->path);
+			seq_printf(s,
+				   "    tx_worker dedicated=%u pinned_cpu=%d tx_last_cb_cpu=%d\n",
+				   !!tbv_path_tx_wq(&rail->path),
+				   tbv_path_tx_wq_cpu(),
+				   READ_ONCE(rail->path.tx_last_cb_cpu));
+			tbv_txtrace_show_summary(s, rail->path.tx_trace);
 		}
 	}
 	mutex_unlock(&state->lock);
@@ -576,6 +504,44 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 }
 
 DEFINE_SHOW_ATTRIBUTE(tbv_debugfs_peers);
+
+/*
+ * Raw per-WR TX stage records: the worst TBV_TX_TRACE_WORST by total first
+ * (so a single multi-millisecond event can be read end to end without
+ * searching), then the ring oldest-first. Every stamp is printed as an offset
+ * from that WR's own post entry, plus the derived intervals.
+ */
+static int tbv_debugfs_tx_trace_show(struct seq_file *s, void *unused)
+{
+	struct tbv_state *state = s->private;
+	struct tbv_peer *peer;
+
+	seq_puts(s,
+		 "# stages: post_entry post_handoff worker_start first_publish last_publish first_cb last_cb cq\n"
+		 "# first_cb/last_cb are the first/last TX completion CALLBACKS observed, an\n"
+		 "# observation bound on the hardware interrupt, not IRQ entry: the Apple NHI\n"
+		 "# handler does schedule_work(&ring->work) and ring_work() runs our callbacks.\n"
+		 "# offsets are ns relative to that WR's post_entry; '-' means the stage was\n"
+		 "# never reached or the interval had no valid sample.\n");
+
+	mutex_lock(&state->lock);
+	list_for_each_entry(peer, &state->peers, node) {
+		struct tbv_rail *rail;
+
+		list_for_each_entry(rail, &peer->rails, node) {
+			char label[32];
+
+			snprintf(label, sizeof(label), "peer%u/rail0x%x",
+				 peer->peer_id, rail->rail_id);
+			tbv_txtrace_show_records(s, rail->path.tx_trace, label);
+		}
+	}
+	mutex_unlock(&state->lock);
+
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(tbv_debugfs_tx_trace);
 
 static int tbv_debugfs_configured_links_show(struct seq_file *s, void *unused)
 {
@@ -601,6 +567,8 @@ int tbv_debugfs_init(struct tbv_state *state)
 			    &tbv_debugfs_peers_fops);
 	debugfs_create_file("configured_links", 0444, state->debugfs_dir,
 			    state, &tbv_debugfs_configured_links_fops);
+	debugfs_create_file("tx_trace", 0444, state->debugfs_dir, state,
+			    &tbv_debugfs_tx_trace_fops);
 	return 0;
 }
 
