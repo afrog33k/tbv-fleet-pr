@@ -81,6 +81,96 @@ module_param(apple_rx_raw_mode, bool, 0644);
 MODULE_PARM_DESC(apple_rx_raw_mode,
 		 "Compatibility no-op: Apple RAW RX is disabled because raw descriptor boundaries are not yet message-safe");
 
+static uint apple_tx_stall_fail_ms = 5000;
+module_param(apple_tx_stall_fail_ms, uint, 0644);
+MODULE_PARM_DESC(apple_tx_stall_fail_ms,
+		 "Apple-compatible TX path: no completion for this many ms with descriptors outstanding fails the connection (error CQEs, ring retirement barrier, rail quarantined); 0 warns only");
+
+/*
+ * Supplemental TX completion polling. -1 = auto (default, unchanged: native
+ * paths only, never Apple), 0 = off everywhere, 1 = on everywhere. The poll
+ * re-arms itself through a 1 ms jiffies delay, so it must never be the timely
+ * completion source on a path whose interrupts work; the lever exists so that
+ * claim can be settled by experiment without a rebuild.
+ */
+static int tx_progress_poll = -1;
+module_param(tx_progress_poll, int, 0644);
+MODULE_PARM_DESC(tx_progress_poll,
+		 "Supplemental 1 ms TX completion polling: -1 auto (native only, default), 0 off, 1 on. Takes effect at the next path start; peers reports the resolved value as tx_poll enabled=");
+
+/*
+ * Supplemental RX completion polling. -1 = auto (default, unchanged for the
+ * Apple backend: native paths only), 0 = off everywhere, 1 = on everywhere.
+ * The RX ring is normally drained by the NHI interrupt; when that interrupt
+ * is lost, a completed frame strands in the ring -- the wire ACK is already
+ * out, so the sender never retransmits, and the receiver never delivers.
+ * Measured 2026-09-11: a UC pingpong froze permanently at exactly this shape
+ * (client send 13242 completed, server posted 13241 replies, no RNR, no dup,
+ * no error, both ends silent). The supp poll reaps such frames within
+ * TBV_RX_SUPP_POLL_DELAY_MS (1 ms) of the last TX post, for a 16 ms window.
+ * Apple stays off: its RX frames carry no per-message sequence and the verbs
+ * receive path there is order-sensitive (see the rx_supp_poll_enabled site).
+ */
+static int rx_supp_poll = -1;
+module_param(rx_supp_poll, int, 0644);
+MODULE_PARM_DESC(rx_supp_poll,
+		 "Supplemental RX completion polling: -1 auto (native only, default), 0 off, 1 on. Rescues RX frames whose completion interrupt was lost; takes effect at the next path start; peers reports the resolved value as rx_supp_poll enabled=");
+
+/*
+ * Placement of the TX post path.
+ *
+ * What can be placed and what cannot, from the code:
+ *
+ *  - The REAP and CQ chain cannot be placed at all. The Apple NHI IRQ handler
+ *    (Asahi apple.c apple_cio_ring_irq) does schedule_work(&ring->work), so
+ *    ring_work() -- and therefore tbv_path_tx_complete() and the CQ push --
+ *    runs on system_percpu_wq on whatever CPU AIC2 delivered the interrupt to.
+ *    AIC2 has no per-IRQ steering: /proc/irq/N/smp_affinity_list is not
+ *    writable on this machine ("Operation not permitted"). Ring poll mode
+ *    (tb_ring's start_poll) would hand us the reap, but tb_ring_poll() never
+ *    calls ring_write_descriptors() -- only ring_work() and __tb_ring_enqueue()
+ *    do -- so a TX ring that filled would stall until the next enqueue. That is
+ *    not an acceptable data path, so poll mode is deliberately NOT used here.
+ *    peers reports tx_last_cb_cpu so where the interrupt lands is at least
+ *    observable.
+ *
+ *  - The POST path can be placed: tqp->apple_sq_work does the payload alloc,
+ *    the per-frame copy, the per-frame doorbell MMIO and the group waits.
+ *    Today it runs on state->workqueue, which is WQ_UNBOUND | WQ_HIGHPRI --
+ *    already high priority, so raising priority again would not be a change.
+ *    apply_workqueue_attrs() and alloc_workqueue_attrs() are not exported, so
+ *    an unbound workqueue cannot be pinned from a module; a BOUND (per-CPU)
+ *    WQ_HIGHPRI workqueue driven with queue_work_on() can.
+ *
+ * zeus topology for tx_worker_cpu: E-cores 0-3 and 12-15 (max 2.42 GHz),
+ * P-cores 4-11 and 16-23 (max 3.26 GHz, idle 702 MHz).
+ */
+static bool tx_worker_dedicated;
+module_param(tx_worker_dedicated, bool, 0644);
+MODULE_PARM_DESC(tx_worker_dedicated,
+		 "Run the Apple SQ post worker on a dedicated per-rail bounded WQ_HIGHPRI workqueue instead of the shared unbound device workqueue; default off (unchanged). Implied by tx_worker_cpu >= 0. Takes effect at the next path start");
+
+static int tx_worker_cpu = -1;
+module_param(tx_worker_cpu, int, 0644);
+MODULE_PARM_DESC(tx_worker_cpu,
+		 "Pin the dedicated Apple SQ post worker to this CPU; -1 = unset (default, unchanged). zeus: E-cores 0-3,12-15 (2.42 GHz max), P-cores 4-11,16-23 (3.26 GHz max, 702 MHz idle). This binds OUR worker only -- the ring interrupt and therefore the reap/CQ chain land wherever AIC2 puts them and cannot be steered");
+
+/*
+ * T2 of the stall ladder. Off by default: re-announcing the producer index is
+ * an experiment, not a documented recovery. It is admissible only because it
+ * is idempotent (see tbv_path_tx_rekick_producer), and it is counted so we can
+ * measure whether it ever precedes a real recovery instead of believing it.
+ */
+static bool apple_tx_stall_rekick;
+module_param(apple_tx_stall_rekick, bool, 0644);
+MODULE_PARM_DESC(apple_tx_stall_rekick,
+		 "Stall ladder T2 (EXPERIMENT, default off): once per stall episode, re-announce the TX ring producer index. Idempotent -- it re-writes the index the hardware should already hold, so it cannot post, reorder or duplicate a descriptor. peers reports tx_stall_recovered_by rekick=");
+
+static uint apple_tx_stall_rekick_ms = 2000;
+module_param(apple_tx_stall_rekick_ms, uint, 0644);
+MODULE_PARM_DESC(apple_tx_stall_rekick_ms,
+		 "Milliseconds without a TX retirement before the T2 producer re-kick fires; must sit between the 1000 ms warn and apple_tx_stall_fail_ms. 0 disables T2");
+
 static uint native_tx_max_inflight = TBV_DATA_TX_MAX_INFLIGHT;
 module_param(native_tx_max_inflight, uint, 0644);
 MODULE_PARM_DESC(native_tx_max_inflight,
@@ -269,6 +359,30 @@ static bool tbv_path_progress_poll_enabled(const struct tbv_path *path)
 	 * Apple FA57 has no transport-level ACK. Early local TX polling can open
 	 * the verbs SQ window before macOS has consumed the previous SEND group.
 	 * Use normal NHI TX callbacks for Apple and reserve polling for native.
+	 */
+	return path->rail->peer->backend == TBV_BACKEND_NATIVE;
+}
+
+static bool tbv_path_rx_supp_poll_enabled(const struct tbv_path *path)
+{
+	int mode = READ_ONCE(rx_supp_poll);
+
+	if (!path->rail || !path->rail->peer)
+		return false;
+
+	if (mode == 0)
+		return false;
+	if (mode > 0)
+		return true;
+
+	/*
+	 * Auto (default): Apple RX frames carry no per-message sequence number
+	 * and the Apple verbs receive path is order-sensitive, so the Apple
+	 * backend keeps RX completion single-sourced. Native frames carry PSNs
+	 * and the native receive path serializes on the QP rx_lock, so the
+	 * supplemental poll is safe there -- and it is the only recovery for a
+	 * frame the NHI completed but never signalled. peers reports the
+	 * resolved value as "rx_supp_poll enabled=".
 	 */
 	return path->rail->peer->backend == TBV_BACKEND_NATIVE;
 }
@@ -1225,14 +1339,13 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 
 	path->tx_poll_enabled = tbv_path_progress_poll_enabled(path);
 	/*
-	 * RX frames for the Apple-compatible verbs path carry no per-message
-	 * sequence number. Processing the same RX ring from the normal
-	 * completion path and a supplemental poller can therefore expose later
-	 * frames to the verbs receive queue before earlier frames. Keep RX
-	 * completion single-sourced; TX polling is still used for timely send
-	 * completions.
+	 * RX completion source policy: see tbv_path_rx_supp_poll_enabled().
+	 * Native-only auto by default; Apple stays single-sourced (its RX
+	 * frames carry no per-message sequence number, so a second reaper
+	 * could expose later frames to the Apple verbs receive queue before
+	 * earlier ones).
 	 */
-	path->rx_supp_poll_enabled = false;
+	path->rx_supp_poll_enabled = tbv_path_rx_supp_poll_enabled(path);
 	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, rx_hop,
 					 path->cfg.rx_ring_size,
 					 path->cfg.rx_flags, e2e_tx_hop,
