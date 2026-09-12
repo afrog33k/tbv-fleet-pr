@@ -2505,24 +2505,37 @@ static int tbv_create_cq(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 	if (!attr || attr->cqe <= 0 || attr->cqe > TBV_IBDEV_MAX_CQE)
 		return -EINVAL;
 
-	len = PAGE_SIZE +
-	      PAGE_ALIGN(attr->cqe *
-			 (sizeof(*tcq->entries) + sizeof(*tcq->shm_ring)));
+	/*
+	 * ONLY the header and the uapi wire-format ring are mapped to userspace.
+	 *
+	 * The kernel's own ib_wc ring is kcalloc'd SEPARATELY and is deliberately
+	 * NOT in the mapped buffer: struct ib_wc carries `struct ib_qp *qp`, a live
+	 * kernel pointer, and anything in this buffer is readable by the process
+	 * that created the CQ. Mapping the two rings together -- which is what an
+	 * earlier revision of this patch did -- hands userspace a kernel address
+	 * and with it a KASLR/heap-layout bypass. The uapi ring is safe because
+	 * ib_uverbs_wc carries qp_num (a u32), not a pointer.
+	 */
+	len = PAGE_SIZE + PAGE_ALIGN(attr->cqe * sizeof(*tcq->shm_ring));
 	tcq->mmap_buf = vmalloc_user(len);
 	if (!tcq->mmap_buf)
 		return -ENOMEM;
 	memset(tcq->mmap_buf, 0, len);
 	tcq->mmap_len = len;
+	tcq->entries = kcalloc(attr->cqe, sizeof(*tcq->entries), GFP_KERNEL);
+	if (!tcq->entries) {
+		vfree(tcq->mmap_buf);
+		tcq->mmap_buf = NULL;
+		return -ENOMEM;
+	}
 	tcq->shm = tcq->mmap_buf;
-	tcq->entries = (struct ib_wc *)((char *)tcq->mmap_buf + PAGE_SIZE);
-	tcq->shm_ring = (struct ib_uverbs_wc *)
-		((char *)tcq->entries + attr->cqe * sizeof(*tcq->entries));
+	tcq->shm_ring = (struct ib_uverbs_wc *)((char *)tcq->mmap_buf + PAGE_SIZE);
 
 	tcq->shm->magic = TBV_CQ_SHM_MAGIC;
 	tcq->shm->abi = TBV_CQ_SHM_ABI;
 	tcq->shm->cqe = attr->cqe;
 	tcq->shm->entry_size = sizeof(struct ib_uverbs_wc);
-	tcq->shm->ring_offset = PAGE_SIZE + attr->cqe * sizeof(struct ib_wc);
+	tcq->shm->ring_offset = PAGE_SIZE;
 	tcq->shm->map_len = len;
 	spin_lock_init(&tcq->lock);
 	tcq->owner = tbv_ibdev_state(cq->device);
@@ -2603,6 +2616,7 @@ static int tbv_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
 		atomic_dec(&tcq->owner->verbs_cqs);
 	if (tcq->mmap_entry)
 		rdma_user_mmap_entry_remove(&tcq->mmap_entry->rdma_entry);
+	kfree(tcq->entries);
 	vfree(tcq->mmap_buf);
 	return 0;
 }
