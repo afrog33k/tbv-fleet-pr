@@ -42,6 +42,17 @@ extern int tb_ring_throttling(struct tb_ring *ring,
 			      unsigned int interval_nsec);
 
 static uint nhi_interrupt_throttle_ns;
+/*
+ * Native data credit-return batch. Upstream pins this policy constant in
+ * proto/native_data.h, which tools/ci/proto-smoke.c guards as wire contract;
+ * the measured fleet value (256) is +28-51% bandwidth at 64-256 KiB, but it
+ * is POLICY, not frame layout, so it lives here behind a param and the wire
+ * header keeps the upstream default. Takes effect at the next path start.
+ */
+static uint tbv_native_credit_batch = 32;
+module_param(tbv_native_credit_batch, uint, 0644);
+MODULE_PARM_DESC(tbv_native_credit_batch,
+		 "Native data credit return batch in frames; header default 32 keeps stock-peer compatibility (fleet runs 256, measured +28-51% at 64-256 KiB). Takes effect at the next path start");
 module_param(nhi_interrupt_throttle_ns, uint, 0644);
 MODULE_PARM_DESC(nhi_interrupt_throttle_ns,
 		 "NHI interrupt throttling interval for TBV data rings in ns; 0 disables ring throttling");
@@ -466,12 +477,34 @@ static u32 tbv_path_data_credit_window(u32 rx_ring_size)
 	else
 		credits = rx_ring_size - TBV_DATA_CREDIT_CONTROL_RESERVE;
 
-	if (credits > TBV_NATIVE_DATA_CREDIT_BATCH)
-		credits -= credits % TBV_NATIVE_DATA_CREDIT_BATCH;
+	if (credits > tbv_native_credit_batch)
+		credits -= credits % tbv_native_credit_batch;
 	if (!credits)
 		credits = 1;
 
 	return credits;
+}
+
+/* path.c-local forms of the proto/native_data.h helpers, parametrized by
+ * tbv_native_credit_batch: the header's inline versions stay pinned to the
+ * upstream wire-contract constant for userspace (tools/ci/proto-smoke.c).
+ */
+static u32 tbv_path_credit_return_threshold(u32 credit_window)
+{
+	if (credit_window && credit_window < tbv_native_credit_batch)
+		return credit_window;
+	return tbv_native_credit_batch;
+}
+
+static u32 tbv_path_start_credit_required(u32 frames, u32 credit_window)
+{
+	u32 threshold;
+
+	if (!frames)
+		return 0;
+
+	threshold = tbv_path_credit_return_threshold(credit_window);
+	return frames < threshold ? frames : threshold;
 }
 
 void tbv_path_set_remote_rx_capacity(struct tbv_path *path, u32 rx_ring_size)
@@ -556,7 +589,7 @@ static void tbv_path_return_rx_data_credit(struct tbv_path *path, u32 credits)
 		return;
 
 	state = tbv_path_state(path);
-	threshold = tbv_native_data_credit_return_threshold(
+	threshold = tbv_path_credit_return_threshold(
 		tbv_path_data_credit_window(path->cfg.rx_ring_size));
 	spin_lock_irqsave(&path->tx_lock, flags);
 	pending = path->rx_data_credit_pending;
@@ -1972,7 +2005,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		old_start_credit_group_frames = packet->start_credit_group_frames;
 		if (!packet->control && path->tx_remote_data_credit_max) {
 			u32 start_credit_required =
-				tbv_native_data_start_credit_required(
+				tbv_path_start_credit_required(
 					packet->start_credit_group_frames,
 					path->tx_remote_data_credit_max);
 
